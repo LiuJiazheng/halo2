@@ -1500,10 +1500,44 @@ impl<F: FromUniformBytes<64> + Ord> MockProver<F> {
         &self.fixed
     }
 
+    /// Return the list of Advice
+    pub fn advice(&self) -> &Vec<Vec<CellValue<F>>> {
+        &self.advice
+    }
+
+    /// Return the list of Instance
+    pub fn instance(&self) -> &Vec<Vec<F>> {
+        &self.instance
+    }
     /// Returns the permutation argument (`Assembly`) used within a MockProver instance.
     pub fn permutation(&self) -> &Assembly {
         &self.permutation
     }
+
+    /// Print all advice, instance and fixed as a table
+    pub fn print_table(&self) {
+        let advice_ = self.advice().clone();
+        let instance_ = self.instance().clone();
+        let fixed_ = self.fixed().clone();
+        println!("ADVICE");
+        for (j, col) in advice_.iter().enumerate() {
+            for (i, cell) in col.iter().enumerate() {
+                println!("({},{}) {:?}", i, j, cell);
+            }
+        }
+        println!("FIXED");
+        for (j, col) in fixed_.iter().enumerate() {
+            for (i, cell) in col.iter().enumerate() {
+                println!("({},{}) {:?}", i, j, cell);
+            }
+        }
+        println!("INSTANCE");
+        for (j, col) in instance_.iter().enumerate() {
+            for (i, cell) in col.iter().enumerate() {
+                println!("({},{}) {:?}", i, j, cell);
+            }
+        }
+        }
 }
 
 #[cfg(test)]
