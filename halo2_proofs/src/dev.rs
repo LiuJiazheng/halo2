@@ -459,6 +459,7 @@ impl<F: Field> Assignment<F> for MockProver<F> {
                     .get_mut(column.index())
                     .and_then(|v| v.get_mut(row))
                     .expect("bounds failure");
+                println!("$$$ In assignment I am targetting row {} col {}, with value {:?}, to value {:?}", row, column.index(), value, to);
                 if let CellValue::Assigned(value) = value {
                     // Inconsistent assignment between different phases.
                     assert_eq!(value, &to, "value={:?}, to={:?}", value, &to);

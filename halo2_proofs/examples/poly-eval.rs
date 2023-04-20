@@ -1,12 +1,11 @@
-use std::{marker::PhantomData, collections::btree_map::Range};
+use std::marker::PhantomData;
 
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Chip, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Fixed, Selector, VirtualCells},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Fixed, Selector},
     poly::Rotation,
 };
-use halo2curves::pasta::pallas::Point;
 
 const EVALADVCOL:usize = 4;
 
@@ -21,19 +20,6 @@ trait PolyEvalInstructions<F: Field>: Chip<F> {
 
     /// Load Element to be used as eval point 
     fn load_element(&self, layouter: impl Layouter<F>, a: Value<F>) -> Result<Self::Elem, Error>;
-
-    /// Init for the first row, for our constraint containing 2 rows
-    fn init(&self, layouter: impl Layouter<F>) -> Result<Self::Elem, Error>;
-
-    /// One step of eval, `res = coeff * x^i`
-    fn step(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        index: usize,
-        coeff: &Self::Coeff,
-        elem: Value<F>,
-        acc: Value<F>,
-    ) -> Result<Self::Elem, Error>;
 
     /// Evaluation
     fn eval(&self, layouter: impl Layouter<F>, coeffs: Vec<Self::Coeff>, elem: Self::Elem) -> Result<Self::Elem, Error>;
@@ -149,36 +135,6 @@ impl<F: Field> PolyEvalInstructions<F> for PolyEvalChip<F> {
         })
     }
 
-    fn init(&self, mut layouter: impl Layouter<F>) -> Result<Self::Elem, Error> {
-        let config = self.config();
-
-        layouter.assign_region(|| "init", |mut region: Region<F>| {
-            region.assign_advice(|| "first acc", config.advice[3], 0, || Value::known(F::ZERO))
-        })
-    }
-
-    fn step(
-            &self,
-            mut layouter: &mut impl Layouter<F>,
-            index: usize,
-            coeff: &Self::Coeff,
-            elem: Value<F>,
-            acc: Value<F>,
-        ) -> Result<Self::Elem, Error> {
-        let config = self.config();
-
-        layouter.assign_region(|| format!("eval step_{}", index), |mut region: Region<F>| {
-            config.e_sel.enable(&mut region, 0);
-
-            coeff.copy_advice(|| format!("coeff_{}", index), &mut region, config.advice[0], 0)?;
-            region.assign_advice(|| format!("x^{}",index), config.advice[1], 0, || elem.clone());
-            let res = coeff.clone().value().copied() * elem;
-            region.assign_advice(|| format!("res_{}", index), config.advice[2], 0, || res);
-            let new_acc = res + acc;
-            region.assign_advice(|| format!("acc_{}",index), config.advice[3], 0, || new_acc)
-        })
-    } 
-
     fn eval(
         &self,
         mut layouter: impl Layouter<F>,
@@ -186,19 +142,61 @@ impl<F: Field> PolyEvalInstructions<F> for PolyEvalChip<F> {
         elem: Self::Elem
     ) -> Result<Self::Elem, Error> {
         let config = self.config();
-        let mut acc = Value::known(F::ZERO);
-        let mut x_pow = Value::known(F::ONE);
 
-        assert!(coeffs.len() > 0);
+        layouter.assign_region(|| "eval region", |mut region: Region<F>| {
+            // Init
+            let mut acc = region.assign_advice(
+                || "init acc to zero",config.advice[3],
+                0, ||Value::known(F::ZERO))?;
+            let mut pow_x = Value::known(F::ONE);
 
-        for (i, coeff) in coeffs.iter().enumerate().take(coeffs.len() - 1){
-            let cell_acc = self.step(&mut layouter, i, coeff, x_pow, acc)?;
-            acc = acc + cell_acc.value();
-            x_pow = x_pow * elem.value();
-        }
+            // Assign the advice according to the coeff list
+            for (i, coeff) in coeffs.iter().enumerate() {
+                // Since our region starts at an aux row which only stores an init acc(F::ZERO)
+                let offset = i + 1;
+                config.e_sel.enable(&mut region, offset)?;
 
-        let last_index = coeffs.len() - 1;
-        self.step(&mut layouter, last_index,&coeffs[last_index], x_pow, acc)
+                // Contrain coeff
+                coeff.copy_advice(|| format!("coeff {}", i), &mut region, config.advice[0], offset)?;
+
+                // Assgin x exponentiation
+                region.assign_advice(|| format!("x power {}", i), config.advice[1], offset, || pow_x)?;
+
+                // Calculate the current result
+                let res = region.assign_advice(
+                    || format!("res {}", i),
+                    config.advice[2],
+                    offset,
+                    || coeff.clone().value().copied() * pow_x
+                )?;
+
+                // At end of each turn, assign acc and store it
+                let prev_acc_value = acc.value().copied();
+                acc = region.assign_advice(|| format!("acc {}", i), config.advice[3], offset, || prev_acc_value + res.value())?;
+
+                // Assign fix
+                region.assign_fixed(
+                    || format!("fixed eval point in {} step", i),
+                    config.point,
+                    offset,
+                    || elem.clone().value().copied()
+                )?;
+
+                // Step pow_x with another mul per se
+                pow_x = pow_x * elem.clone().value().copied();
+            }
+            
+            // Since we use only one selector on 3 gates, then we have to satisfy gate `pow x`
+            // by providing one more row
+            region.assign_advice(
+                || format!("final row for pow x gate {}",coeffs.len()),
+                config.advice[1],
+                coeffs.len() + 1,
+                || pow_x
+            )?;
+
+            Ok(acc)
+        })
     }
 
     fn reveal(&self, mut layouter: impl Layouter<F>, elem: Self::Elem, row: usize) -> Result<(), Error> {
@@ -248,7 +246,8 @@ impl<F:Field> Circuit<F> for PolyEvalCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let advice = [meta.advice_column(); EVALADVCOL];
+        let advice = [meta.advice_column(), meta.advice_column(),
+                                           meta.advice_column(), meta.advice_column()];
 
         let instance = meta.instance_column();
 
@@ -264,8 +263,6 @@ impl<F:Field> Circuit<F> for PolyEvalCircuit<F> {
 
         let point_cell = chip.load_element(layouter.namespace(|| "load eval point in syn"), self.point)?;
 
-        let _ = chip.init(layouter.namespace(|| "init in syn"))?;
-    
         let evaluation = chip.eval(layouter.namespace(|| "eval in syn"), coeff_cells, point_cell)?;
 
         chip.reveal(layouter.namespace(|| "reveal"), evaluation, 0)
@@ -277,10 +274,10 @@ fn main() {
     use halo2_proofs::dev::MockProver;
     use halo2curves::pasta::Fp;
 
-    let k = 16;
+    let k = 4;
 
-    let test_list = 1..4;
-    let test_point = 2;
+    let test_list = [1,2,3];
+    let test_point = 5;
 
     let coeffs: Vec<Value<Fp>> = test_list.clone().into_iter().map(|x| {Value::known(Fp::from(x))}).collect();
 
@@ -301,7 +298,7 @@ fn main() {
         acc
     }
 
-    let instance = poly_eval(test_list.collect(), test_point);
+    let instance = poly_eval(test_list.to_vec(), test_point);
     println!("the instance implemented by outside proof system is {}", instance.clone());
 
     let public_inputs = vec![Fp::from(instance)];
