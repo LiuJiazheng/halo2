@@ -142,7 +142,7 @@ impl Calculation {
                 previous_value,
             )
         };
-        match self {
+        let res = match self {
             Calculation::Add(a, b) => get_value(a) + get_value(b),
             Calculation::Sub(a, b) => get_value(a) - get_value(b),
             Calculation::Mul(a, b) => get_value(a) * get_value(b),
@@ -158,7 +158,9 @@ impl Calculation {
                 value
             }
             Calculation::Store(v) => get_value(v),
-        }
+        };
+        println!("In evaluation doing calc {:?}", self);
+        res
     }
 }
 

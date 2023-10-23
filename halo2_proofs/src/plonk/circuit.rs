@@ -1942,6 +1942,12 @@ impl<F: Field> ConstraintSystem<F> {
             "Gates must contain at least one constraint."
         );
 
+        println!(
+            "Creating gates {}, with poly {:?}",
+            name.as_ref().to_string(),
+            polys
+        );
+
         self.gates.push(Gate {
             name: name.as_ref().to_string(),
             constraint_names,
