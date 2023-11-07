@@ -18,12 +18,13 @@ struct MemTableChip<F: Field> {
 
 #[derive(Clone, Debug)]
 struct MemTableConfig {
-    // | addr | is_addr_identical_bit | id | is_access_type_init | is_access_type_last_write | value |
+    // | addr | addr_delta_inv | id | is_access_type_init | is_access_type_last_write | value |
     advice: [Column<Advice>; 6],
     // | binary_range | memory_range | value_range |
     range: [TableColumn; 3],
     // Selector for region
     sel: Selector,
+    init_sel: Selector,
 }
 
 impl<F: Field> Chip<F> for MemTableChip<F> {
@@ -87,7 +88,11 @@ impl<F: Field> MemTableChip<F> {
             panic!("wrong match")
         };
 
+        // Sel_selector is only used within this chip
+        let init_sel = meta.complex_selector();
+
         // Lookup Conditions:
+        // 1. Init selector shall show ONCE and ONLY ONCE
         // 2. Col acc_init_bit must be {0,1}
         // 3. Col acc_last_write_bit must be {0,1}
         // 4. id must be in memory range (for now)
@@ -98,8 +103,18 @@ impl<F: Field> MemTableChip<F> {
         // Cannot do a federal query since the tuple (a,b,c...) is not in the lookup table (bianry_range, binary_range, memorary_range...)
         // Each one should be a separate query
 
+        // Since selectors are all from {0, 1}
+        meta.lookup_any("memory table range check 1 init once only once", |meta| {
+            let init_s = meta.query_selector(init_sel);
+            let s = meta.query_selector(sel);
+            let one = Expression::Constant(F::ONE);
+
+            // init sel shows once
+            vec![(one, init_s * s)]
+        });
+
         meta.lookup(
-            "memory tabel range check 2: acc_init_bit must be {0,1}",
+            "memory table range check 2: acc_init_bit must be {0,1}",
             |meta| {
                 let s = meta.query_selector(sel);
                 let acc_init_bit = meta.query_advice(is_access_type_init, Rotation::next());
@@ -109,7 +124,7 @@ impl<F: Field> MemTableChip<F> {
         );
 
         meta.lookup(
-            "memory tabel range check 3: acc_last_write_bit must be {0,1}",
+            "memory table range check 3: acc_last_write_bit must be {0,1}",
             |meta| {
                 let s = meta.query_selector(sel);
                 let acc_last_write_bit =
@@ -234,7 +249,37 @@ impl<F: Field> MemTableChip<F> {
             ]
         });
 
-        MemTableConfig { advice, range, sel }
+        meta.create_gate("tbl first line check", |meta| {
+            // Query selectors
+            let init_s = meta.query_selector(init_sel);
+            let s = meta.query_selector(sel);
+
+            // Prepare constant
+            let one = Expression::Constant(F::ONE);
+            // Query init bit
+            let init_bit = meta.query_advice(is_access_type_init, Rotation::cur());
+            // Query last write bit
+            let prev_last_write_bit =
+                meta.query_advice(is_access_type_last_write, Rotation::prev());
+
+            // Conditions:
+            // 1. init selector is on, acc_init_bit == 1
+            // 2. init selector shall be placed on first row,
+            //    if this selctor is in the middle, by previous constraints, we immediately know, the address must be different.
+            //    By constraint that the different is same (is_zero_bit == 1), that excludes that case where the init selector being
+            //    placed in the middle while still passing all the constraints
+            vec![
+                s.clone() * init_s.clone() * (one.clone() - init_bit),
+                s * init_s * prev_last_write_bit,
+            ]
+        });
+
+        MemTableConfig {
+            advice,
+            range,
+            sel,
+            init_sel,
+        }
     }
 
     fn assign_range(&self, mut layouter: impl Layouter<F>) -> Result<(), Error> {
@@ -325,36 +370,83 @@ impl<F: Field> MemTableChip<F> {
             } else {
                 panic!("wrong match")
             };
-        
+
         // Prepare vec for return
         let mut lw_entries: Vec<MemTableEntry<F>> = vec![];
 
         // Allocate mem table entries
+        // assign_region would be called even in single pass layouter
+        // Once for region shape, once for real cells assignment
         let _ = layouter.assign_region(
             || "assign mem table",
             |mut region: Region<F>| {
+                let offset = 1;
+                // First padding
+                if !entries.is_empty() {
+                    // Address is not inforced
+                    region.assign_advice(|| "padding addr", addr, 0, || Value::known(F::ZERO))?;
+                    // The dela is one and invert is one as well
+                    region.assign_advice(
+                        || "padding addr delta inv",
+                        addr_delta_inv,
+                        0,
+                        || Value::known(F::ZERO),
+                    )?;
+                    // Id is not enforced
+                    region.assign_advice(|| "padding id", id, 0, || Value::known(F::ZERO))?;
+                    // Init would be one
+                    region.assign_advice(
+                        || "padding init",
+                        is_access_type_init,
+                        0,
+                        || Value::known(F::ZERO),
+                    )?;
+                    // This one is critical, we use this procotol to make sure that the real init
+                    region.assign_advice(
+                        || "padding last write",
+                        is_access_type_last_write,
+                        0,
+                        || Value::known(F::ZERO),
+                    )?;
+                    // Value is not enforced
+                    region.assign_advice(|| "padding value", value, 0, || Value::known(F::ZERO))?;
+                }
+
                 // | addr | is_addr_identical_bit | id | is_access_type_init | is_access_type_last_write | value | sel |
                 for (i, entry) in entries.iter().enumerate() {
+                    // Selector is enabled for all rows
+                    config.sel.enable(&mut region, i + offset)?;
                     // First one, no need for addr_bit
                     if i == 0 {
                         region.assign_advice(
                             || "first addr",
                             addr,
-                            i,
+                            i + offset,
                             || Value::known(entry.addr),
                         )?;
-                        region.assign_advice(|| "first id", id, i, || Value::known(entry.id))?;
+                        region.assign_advice(
+                            || "first addr_delta_inv",
+                            addr_delta_inv,
+                            i + offset,
+                            || Value::known(F::ZERO),
+                        )?; // This one shall not be checked, but cannot be None as well
+                        region.assign_advice(
+                            || "first id",
+                            id,
+                            i + offset,
+                            || Value::known(entry.id),
+                        )?;
                         region.assign_advice(
                             || "first init",
                             is_access_type_init,
-                            i,
+                            i + offset,
                             || Value::known(F::ONE),
                         )?;
                         if entries.len() > 1 {
                             region.assign_advice(
                                 || "first write be last write",
                                 is_access_type_last_write,
-                                i,
+                                i + offset,
                                 || is_not_equal!(entry.addr, entries[i + 1].addr),
                             )?;
 
@@ -370,24 +462,25 @@ impl<F: Field> MemTableChip<F> {
                         region.assign_advice(
                             || "first value",
                             value,
-                            i,
+                            i + offset,
                             || Value::known(entry.value),
                         )?;
-                        config.sel.enable(&mut region, i)?;
+                        // Enable init selector
+                        config.init_sel.enable(&mut region, i + offset)?;
                     }
-                    // Last one, no need for sel
+                    // Last one
                     else if i == entries.len() - 1 {
                         region.assign_advice(
                             || "last addr",
                             addr,
-                            i,
+                            i + offset,
                             || Value::known(entry.addr),
                         )?;
                         if entries.len() > 1 {
                             region.assign_advice(
-                                || "last addr_bit",
+                                || "last addr_delta_inv",
                                 addr_delta_inv,
-                                i,
+                                i + offset,
                                 || {
                                     Value::known(
                                         (entry.addr - entries[i - 1].addr)
@@ -397,23 +490,28 @@ impl<F: Field> MemTableChip<F> {
                                 },
                             )?;
                         }
-                        region.assign_advice(|| "last id", id, i, || Value::known(entry.id))?;
+                        region.assign_advice(
+                            || "last id",
+                            id,
+                            i + offset,
+                            || Value::known(entry.id),
+                        )?;
                         region.assign_advice(
                             || "last init",
                             is_access_type_init,
-                            i,
+                            i + offset,
                             || is_not_equal!(entry.addr, entries[i - 1].addr),
                         )?;
                         region.assign_advice(
                             || "last write",
                             is_access_type_last_write,
-                            i,
+                            i + offset,
                             || Value::known(F::ONE),
                         )?; // Must be last write for sure
                         region.assign_advice(
                             || "last value",
                             value,
-                            i,
+                            i + offset,
                             || Value::known(entry.value),
                         )?;
                         // Must be last write entry
@@ -428,13 +526,13 @@ impl<F: Field> MemTableChip<F> {
                         region.assign_advice(
                             || format!("{} addr", i),
                             addr,
-                            i,
+                            i + offset,
                             || Value::known(entry.addr),
                         )?;
                         region.assign_advice(
-                            || format!("{} addr_bit", i),
+                            || format!("{} addr_delta_inv", i),
                             addr_delta_inv,
-                            i,
+                            i + offset,
                             || {
                                 Value::known(
                                     (entry.addr - entries[i - 1].addr)
@@ -446,28 +544,27 @@ impl<F: Field> MemTableChip<F> {
                         region.assign_advice(
                             || format!("{} id", i),
                             id,
-                            i,
+                            i + offset,
                             || Value::known(entry.id),
                         )?;
                         region.assign_advice(
                             || format!("{} init", i),
                             is_access_type_init,
-                            i,
+                            i + offset,
                             || is_not_equal!(entry.addr, entries[i - 1].addr),
                         )?;
                         region.assign_advice(
                             || format!("{} write", i),
                             is_access_type_last_write,
-                            i,
+                            i + offset,
                             || is_not_equal!(entry.addr, entries[i + 1].addr),
                         )?;
                         region.assign_advice(
                             || format!("{} value", i),
                             value,
-                            i,
+                            i + offset,
                             || Value::known(entry.value),
                         )?;
-                        config.sel.enable(&mut region, i)?;
                         // If it is last write, store it
                         if entry.addr != entries[i + 1].addr {
                             lw_entries.push(MemTableEntry {
@@ -478,9 +575,60 @@ impl<F: Field> MemTableChip<F> {
                         }
                     }
                 }
+                // Padding last one
+                if !entries.is_empty() {
+                    // Address is always ascending
+                    // Right now we only need to keep that constraint holds
+                    // But we can reserve a special value later
+                    region.assign_advice(
+                        || "padding addr",
+                        addr,
+                        entries.len() + offset,
+                        || Value::known(entries[entries.len() - 1].addr + F::ONE),
+                    )?;
+                    // The dela is one and invert is one as well
+                    region.assign_advice(
+                        || "padding addr delta inv",
+                        addr_delta_inv,
+                        entries.len() + offset,
+                        || Value::known(F::ONE),
+                    )?;
+                    // Id is not enforced
+                    region.assign_advice(
+                        || "padding id",
+                        id,
+                        entries.len() + offset,
+                        || Value::known(F::ZERO),
+                    )?;
+                    // Init would be one
+                    region.assign_advice(
+                        || "padding init",
+                        is_access_type_init,
+                        entries.len() + offset,
+                        || Value::known(F::ONE),
+                    )?;
+                    // Is last write
+                    region.assign_advice(
+                        || "padding last write",
+                        is_access_type_last_write,
+                        entries.len() + offset,
+                        || Value::known(F::ONE),
+                    )?;
+                    // Value is not enforced
+                    region.assign_advice(
+                        || "padding value",
+                        value,
+                        entries.len() + offset,
+                        || Value::known(F::ZERO),
+                    )?;
+                }
                 Ok(())
             },
         )?;
+
+        // We know lw_entries went twice
+        assert!(lw_entries.len() % 2 == 0);
+        lw_entries.truncate(lw_entries.len() / 2);
 
         Ok(lw_entries)
     }
@@ -542,15 +690,18 @@ impl<F: Field> LastWriteTableChip<F> {
 
         // Load name of columns
         let (memtbl_addr, memtbl_id, memtbl_value, is_last_write) = if let [addr, id, value, is_last_write] =
-            (0..4).map(|i| memtbl_schema[i]).collect::<Vec<Column<Advice>>>()[..]
+            (0..4)
+                .map(|i| memtbl_schema[i])
+                .collect::<Vec<Column<Advice>>>()[..]
         {
             (addr, id, value, is_last_write)
         } else {
             panic!("wrong match")
         };
 
-        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] =
-            (0..4).map(|i| last_write_schema[i]).collect::<Vec<Column<Advice>>>()[..]
+        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] = (0..4)
+            .map(|i| last_write_schema[i])
+            .collect::<Vec<Column<Advice>>>()[..]
         {
             (addr, id, value, heritage)
         } else {
@@ -645,7 +796,7 @@ impl<F: Field> LastWriteTableChip<F> {
                 sel.enable(&mut region, 0)?;
                 Ok(())
             },
-        )   
+        )
     }
 
     fn assign_lwtbl_from_memtbl(
@@ -654,8 +805,9 @@ impl<F: Field> LastWriteTableChip<F> {
         memtbl_entries: &[MemTableEntry<F>],
     ) -> Result<(), Error> {
         let config = &self.config;
-        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] =
-            (0..4).map(|i| config.advice[i]).collect::<Vec<Column<Advice>>>()[..]
+        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] = (0..4)
+            .map(|i| config.advice[i])
+            .collect::<Vec<Column<Advice>>>()[..]
         {
             (addr, id, value, heritage)
         } else {
@@ -735,13 +887,18 @@ where
         let memtbl_advice = [(); 6].map(|_| meta.advice_column());
         let range = [(); 3].map(|_| meta.lookup_table_column());
         let memtbl_sel = meta.complex_selector();
-    
+
         let lw_advice = [(); 4].map(|_| meta.advice_column());
         let lw_sel = meta.complex_selector();
         // Reference memtbl schema
         // | addr | id | value | is_last_write |
         // Order really matters, latter we can make it several const
-        let ref_memtbl_schema = [memtbl_advice[0], memtbl_advice[2], memtbl_advice[5], memtbl_advice[4]];
+        let ref_memtbl_schema = [
+            memtbl_advice[0],
+            memtbl_advice[2],
+            memtbl_advice[5],
+            memtbl_advice[4],
+        ];
         let binary_range = range[0];
 
         let memtbl_config = MemTableChip::configure(meta, memtbl_advice, range, memtbl_sel);
@@ -770,33 +927,28 @@ where
         // Assign range
         memtbl_chip.assign_range(layouter.namespace(|| "assign range"))?;
         // Assign table
-        let lwtbl_from_memtbl = memtbl_chip.assign_table(layouter.namespace(|| "assign table"), &self.entries).unwrap();
+        let lwtbl_from_memtbl = memtbl_chip
+            .assign_table(layouter.namespace(|| "assign table"), &self.entries)
+            .unwrap();
 
+        //let mut lwtbl_from_memtbl = lwtbl_from_memtbl[..lwtbl_from_memtbl.len() - 1].to_vec();
+        //lwtbl_from_memtbl[0].id = lwtbl_from_memtbl[0].id + F::ONE;;
+        println!("Single synthesize: ");
         for entry in lwtbl_from_memtbl.iter() {
-            println!("addr: {:?}, id: {:?}, value: {:?}", entry.addr, entry.id, entry.value);
+            println!(
+                "addr: {:?}, id: {:?}, value: {:?}",
+                entry.addr, entry.id, entry.value
+            );
         }
-        let lwtbl_from_memtbl = lwtbl_from_memtbl[..lwtbl_from_memtbl.len() - 1].to_vec();
+        println!("End of single synthesize");
         // Get LastWriteTableChip
         let lwtbl_chip = LastWriteTableChip::<F>::construct(config.lwtbl_config);
-        // Memtbl schema | addr | id | value |
-        let ref_memtbl_schema = [
-            memtbl_chip.config().advice[0],
-            memtbl_chip.config().advice[2],
-            memtbl_chip.config().advice[5],
-        ];
-        // Lwtbk schema | addr | id | value |
-        let ref_lwtbl_schema = [
-            lwtbl_chip.config().advice[0],
-            lwtbl_chip.config().advice[1],
-            lwtbl_chip.config().advice[2],
-        ];
-        // Assign zero padding on memtbl
-        //LastWriteTableChip::<F>::zero_padding_one_row(layouter.namespace(|| "zero padding on memtbl"), ref_memtbl_schema, memtbl_chip.config.sel)?;
-        // Assign zero padding on lwtbl
-        //LastWriteTableChip::<F>::zero_padding_one_row(layouter.namespace(|| "zero padding on lwtbl"), ref_lwtbl_schema, lwtbl_chip.config.sel)?;
 
         // Assign lwtbl from memtbl
-        lwtbl_chip.assign_lwtbl_from_memtbl(layouter.namespace(|| "assign lwtbl from memtbl"), &lwtbl_from_memtbl)?;
+        lwtbl_chip.assign_lwtbl_from_memtbl(
+            layouter.namespace(|| "assign lwtbl from memtbl"),
+            &lwtbl_from_memtbl,
+        )?;
 
         Ok(())
     }
@@ -856,7 +1008,10 @@ fn main() {
 
     println!("Sorted Entries are: ");
     for entry in entries.iter() {
-        println!("addr: {:?}, id: {:?}, value: {:?}", entry.addr, entry.id, entry.value);
+        println!(
+            "addr: {:?}, id: {:?}, value: {:?}",
+            entry.addr, entry.id, entry.value
+        );
     }
     println!("End of sorted entries");
 
