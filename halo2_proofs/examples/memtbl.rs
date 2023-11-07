@@ -16,7 +16,7 @@ struct MemTableChip<F: Field> {
     _marker: PhantomData<F>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MemTableConfig {
     // | addr | is_addr_identical_bit | id | is_access_type_init | is_access_type_last_write | value |
     advice: [Column<Advice>; 6],
@@ -40,7 +40,6 @@ impl<F: Field> Chip<F> for MemTableChip<F> {
 }
 
 impl<F: Field> MemTableChip<F> {
-    #[allow(unused)]
     fn construct(config: <Self as Chip<F>>::Config) -> Self {
         Self {
             config,
@@ -59,7 +58,12 @@ impl<F: Field> MemTableChip<F> {
         meta: &mut ConstraintSystem<F>,
         advice: [Column<Advice>; 6],
         range: [TableColumn; 3],
+        sel: Selector,
     ) -> <Self as Chip<F>>::Config {
+        for col in advice.iter() {
+            meta.enable_equality(*col);
+        }
+
         let (addr, addr_delta_inv, id, is_access_type_init, is_access_type_last_write, value) =
             if let [addr, addr_delta_inv, id, is_access_type_init, is_access_type_last_write, value] =
                 (0..6).map(|i| advice[i]).collect::<Vec<Column<Advice>>>()[..]
@@ -82,7 +86,6 @@ impl<F: Field> MemTableChip<F> {
         } else {
             panic!("wrong match")
         };
-        let sel = meta.complex_selector();
 
         // Lookup Conditions:
         // 2. Col acc_init_bit must be {0,1}
@@ -225,62 +228,28 @@ impl<F: Field> MemTableChip<F> {
                 s.clone()
                     * ((one.clone() - is_zero_bit.clone()) * (one.clone() - acc_init_bit.clone())
                         + is_zero_bit.clone() * acc_init_bit.clone()),
-                s * ((one.clone() - is_zero_bit.clone()) * (one - acc_last_write_bit.clone())
+                s * ((one.clone() - is_zero_bit.clone())
+                    * (one.clone() - acc_last_write_bit.clone())
                     + is_zero_bit * acc_last_write_bit),
             ]
         });
 
         MemTableConfig { advice, range, sel }
     }
-}
 
-#[derive(Clone, Debug)]
-struct MemTableEntry<F: Field> {
-    addr: F,
-    id: F,
-    value: F,
-}
-
-#[derive(Default, Debug)]
-struct MinimalMemTable<F: Field> {
-    entries: Vec<MemTableEntry<F>>,
-}
-
-impl<F> Circuit<F> for MinimalMemTable<F>
-where
-    F: Field,
-{
-    type Config = MemTableConfig;
-    type FloorPlanner = SimpleFloorPlanner;
-    #[cfg(feature = "circuit-params")]
-    type Params = ();
-
-    fn without_witnesses(&self) -> Self {
-        Self::default()
-    }
-
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let advice = [(); 6].map(|_| meta.advice_column());
-        let range = [(); 3].map(|_| meta.lookup_table_column());
-
-        MemTableChip::configure(meta, advice, range)
-    }
-
-    fn synthesize(
-        &self,
-        config: Self::Config,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
-        // Allocate the table
+    fn assign_range(&self, mut layouter: impl Layouter<F>) -> Result<(), Error> {
+        let config = &self.config;
         let (binary_range, memory_range, value_range) = if let [binary_range, memory_range, value_range] =
-            (0..3).map(|i| config.range[i]).collect::<Vec<TableColumn>>()[..]
+            (0..3)
+                .map(|i| config.range[i])
+                .collect::<Vec<TableColumn>>()[..]
         {
             (binary_range, memory_range, value_range)
         } else {
             panic!("wrong match")
         };
 
-        let _ = layouter.assign_table(
+        let res_binary = layouter.assign_table(
             || "assign binary table",
             |mut table| {
                 table.assign_cell(|| "binary range", binary_range, 0, || Value::known(F::ZERO))?;
@@ -290,7 +259,7 @@ where
         );
 
         let mut acc = F::ZERO;
-        let _ = layouter.assign_table(
+        let res_mem = layouter.assign_table(
             || "assign memory table",
             |mut table| {
                 for i in 0..(1 << MEM_RANGE_BITS) {
@@ -302,7 +271,7 @@ where
         );
 
         acc = F::ZERO;
-        let _ = layouter.assign_table(
+        let res_val = layouter.assign_table(
             || "assign value table",
             |mut table| {
                 for i in 0..(1 << VALUE_RANGE_BITS) {
@@ -313,9 +282,22 @@ where
             },
         );
 
-        // Sort entries by address and then by id
-        let entries = &self.entries;
+        // Make sure no res is in error
+        let res = [res_binary, res_mem, res_val];
+        for res in res.iter() {
+            if let Err(_) = res {
+                return Err(Error::Synthesis);
+            }
+        }
+        Ok(())
+    }
 
+    fn assign_table(
+        &self,
+        mut layouter: impl Layouter<F>,
+        entries: &[MemTableEntry<F>],
+    ) -> Result<Vec<MemTableEntry<F>>, Error> {
+        let config = &self.config;
         macro_rules! is_not_equal {
             ($lhs:expr, $rhs:expr) => {
                 if $lhs != $rhs {
@@ -328,7 +310,9 @@ where
 
         let (addr, addr_delta_inv, id, is_access_type_init, is_access_type_last_write, value) =
             if let [addr, addr_delta_inv, id, is_access_type_init, is_access_type_last_write, value] =
-                (0..6).map(|i| config.advice[i]).collect::<Vec<Column<Advice>>>()[..]
+                (0..6)
+                    .map(|i| config.advice[i])
+                    .collect::<Vec<Column<Advice>>>()[..]
             {
                 (
                     addr,
@@ -341,8 +325,12 @@ where
             } else {
                 panic!("wrong match")
             };
+        
+        // Prepare vec for return
+        let mut lw_entries: Vec<MemTableEntry<F>> = vec![];
+
         // Allocate mem table entries
-        layouter.assign_region(
+        let _ = layouter.assign_region(
             || "assign mem table",
             |mut region: Region<F>| {
                 // | addr | is_addr_identical_bit | id | is_access_type_init | is_access_type_last_write | value | sel |
@@ -369,6 +357,15 @@ where
                                 i,
                                 || is_not_equal!(entry.addr, entries[i + 1].addr),
                             )?;
+
+                            if entry.addr != entries[i + 1].addr {
+                                // store last write entry
+                                lw_entries.push(MemTableEntry {
+                                    addr: entry.addr,
+                                    id: entry.id,
+                                    value: entry.value,
+                                });
+                            }
                         }
                         region.assign_advice(
                             || "first value",
@@ -419,6 +416,12 @@ where
                             i,
                             || Value::known(entry.value),
                         )?;
+                        // Must be last write entry
+                        lw_entries.push(MemTableEntry {
+                            addr: entry.addr,
+                            id: entry.id,
+                            value: entry.value,
+                        });
                     }
                     // Other rows
                     else {
@@ -465,11 +468,337 @@ where
                             || Value::known(entry.value),
                         )?;
                         config.sel.enable(&mut region, i)?;
+                        // If it is last write, store it
+                        if entry.addr != entries[i + 1].addr {
+                            lw_entries.push(MemTableEntry {
+                                addr: entry.addr,
+                                id: entry.id,
+                                value: entry.value,
+                            });
+                        }
                     }
                 }
                 Ok(())
             },
+        )?;
+
+        Ok(lw_entries)
+    }
+}
+
+struct LastWriteTableChip<F: Field> {
+    config: LastWriteTableConfig,
+    _marker: PhantomData<F>,
+}
+
+#[derive(Clone, Debug)]
+struct LastWriteTableConfig {
+    // | addr | id | value | heritage |
+    advice: [Column<Advice>; 4],
+    // selector for region
+    sel: Selector,
+}
+
+impl<F: Field> Chip<F> for LastWriteTableChip<F> {
+    type Config = LastWriteTableConfig;
+    type Loaded = ();
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn loaded(&self) -> &Self::Loaded {
+        &()
+    }
+}
+
+impl<F: Field> LastWriteTableChip<F> {
+    fn construct(config: <Self as Chip<F>>::Config) -> Self {
+        Self {
+            config,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Configure the last write table
+    /// memtbl_schema: [addr, id, value, is_last_write]
+    /// last_write_schema: [addr, id, value, heritage]
+    fn configure(
+        meta: &mut ConstraintSystem<F>,
+        memtbl_schema: [Column<Advice>; 4],
+        memtbl_sel: Selector,
+        last_write_schema: [Column<Advice>; 4],
+        last_write_sel: Selector,
+        binary_range: TableColumn,
+    ) -> <Self as Chip<F>>::Config {
+        // Enforce equality
+        for col in memtbl_schema.iter() {
+            meta.enable_equality(*col);
+        }
+
+        for col in last_write_schema.iter() {
+            meta.enable_equality(*col);
+        }
+
+        // Load name of columns
+        let (memtbl_addr, memtbl_id, memtbl_value, is_last_write) = if let [addr, id, value, is_last_write] =
+            (0..4).map(|i| memtbl_schema[i]).collect::<Vec<Column<Advice>>>()[..]
+        {
+            (addr, id, value, is_last_write)
+        } else {
+            panic!("wrong match")
+        };
+
+        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] =
+            (0..4).map(|i| last_write_schema[i]).collect::<Vec<Column<Advice>>>()[..]
+        {
+            (addr, id, value, heritage)
+        } else {
+            panic!("wrong match")
+        };
+
+        // Lookup Conditions:
+        // heritage must be in binary range
+        meta.lookup("lw table col heritage", |meta| {
+            let s = meta.query_selector(last_write_sel);
+            let heritage = meta.query_advice(heritage, Rotation::cur());
+
+            vec![(s * heritage, binary_range)]
+        });
+
+        // Lookup Conditions:
+        // is_last_write must be in binary range
+        meta.lookup("memtbl col is_last_write", |meta| {
+            let s = meta.query_selector(memtbl_sel);
+            let is_last_write = meta.query_advice(is_last_write, Rotation::cur());
+
+            vec![(s * is_last_write, binary_range)]
+        });
+
+        // Lookup Conditions:
+        // For any row in lw table, it comes from a row in mem table
+        meta.lookup_any("lw tbl belongs to memtbl", |meta| {
+            let s = meta.query_selector(last_write_sel);
+            let lw_addr = meta.query_advice(lw_addr, Rotation::cur());
+            let lw_id = meta.query_advice(lw_id, Rotation::cur());
+            let lw_value = meta.query_advice(lw_value, Rotation::cur());
+
+            let memtbl_addr = meta.query_advice(memtbl_addr, Rotation::cur());
+            let memtbl_id = meta.query_advice(memtbl_id, Rotation::cur());
+            let memtbl_value = meta.query_advice(memtbl_value, Rotation::cur());
+
+            vec![
+                (s.clone() * lw_addr, memtbl_addr),
+                (s.clone() * lw_id, memtbl_id),
+                (s * lw_value, memtbl_value),
+            ]
+        });
+
+        // Lookup Conditions:
+        // For any row in mem table, and it is marked as 'last write', it must belong to a row in lw table
+        // Thus, lw table is exact the extraction of mem table with 'last write' marked -- every last write entry from memtbl has
+        // been present in lw table, and only once. The uniqueness of lw table entry is guaranteed by the uniqueness of last write entry of mem table
+        meta.lookup_any("memtbl last write entry belongs to lw table", |meta| {
+            let s = meta.query_selector(memtbl_sel);
+            let memtbl_addr = meta.query_advice(memtbl_addr, Rotation::cur());
+            let memtbl_id = meta.query_advice(memtbl_id, Rotation::cur());
+            let memtbl_value = meta.query_advice(memtbl_value, Rotation::cur());
+            let is_last_write = meta.query_advice(is_last_write, Rotation::cur());
+
+            let lw_addr = meta.query_advice(lw_addr, Rotation::cur());
+            let lw_id = meta.query_advice(lw_id, Rotation::cur());
+            let lw_value = meta.query_advice(lw_value, Rotation::cur());
+
+            vec![
+                (s.clone() * memtbl_addr * is_last_write.clone(), lw_addr),
+                (s.clone() * memtbl_id * is_last_write.clone(), lw_id),
+                (s * memtbl_value * is_last_write, lw_value),
+            ]
+        });
+
+        LastWriteTableConfig {
+            advice: last_write_schema,
+            sel: last_write_sel,
+        }
+    }
+
+    #[allow(unused)]
+    fn zero_padding_one_row(
+        mut layouter: impl Layouter<F>,
+        schema: [Column<Advice>; 3],
+        sel: Selector,
+    ) -> Result<(), Error> {
+        let (addr, id, value) = if let [addr, id, value] =
+            (0..3).map(|i| schema[i]).collect::<Vec<Column<Advice>>>()[..]
+        {
+            (addr, id, value)
+        } else {
+            panic!("wrong match")
+        };
+
+        layouter.assign_region(
+            || "zero padding one row",
+            |mut region: Region<F>| {
+                region.assign_advice(|| "addr", addr, 0, || Value::known(F::ZERO))?;
+                region.assign_advice(|| "id", id, 0, || Value::known(F::ZERO))?;
+                region.assign_advice(|| "value", value, 0, || Value::known(F::ZERO))?;
+                sel.enable(&mut region, 0)?;
+                Ok(())
+            },
+        )   
+    }
+
+    fn assign_lwtbl_from_memtbl(
+        &self,
+        mut layouter: impl Layouter<F>,
+        memtbl_entries: &[MemTableEntry<F>],
+    ) -> Result<(), Error> {
+        let config = &self.config;
+        let (lw_addr, lw_id, lw_value, heritage) = if let [addr, id, value, heritage] =
+            (0..4).map(|i| config.advice[i]).collect::<Vec<Column<Advice>>>()[..]
+        {
+            (addr, id, value, heritage)
+        } else {
+            panic!("wrong match")
+        };
+
+        // Allocate lwtbl based on the given entries
+        layouter.assign_region(
+            || "assign lw table",
+            |mut region: Region<F>| {
+                for (i, entry) in memtbl_entries.iter().enumerate() {
+                    region.assign_advice(
+                        || format!("{} addr", i),
+                        lw_addr,
+                        i,
+                        || Value::known(entry.addr),
+                    )?;
+                    region.assign_advice(
+                        || format!("{} id", i),
+                        lw_id,
+                        i,
+                        || Value::known(entry.id),
+                    )?;
+                    region.assign_advice(
+                        || format!("{} value", i),
+                        lw_value,
+                        i,
+                        || Value::known(entry.value),
+                    )?;
+                    // This one is 'extracted' from memtbl, not a heritage
+                    region.assign_advice(
+                        || format!("{} heritage", i),
+                        heritage,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    config.sel.enable(&mut region, i)?;
+                }
+                Ok(())
+            },
         )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MemTableEntry<F: Field> {
+    addr: F,
+    id: F,
+    value: F,
+}
+
+#[derive(Clone, Debug)]
+struct CircuitConfig {
+    memtbl_config: MemTableConfig,
+    lwtbl_config: LastWriteTableConfig,
+}
+
+#[derive(Default, Debug)]
+struct MinimalMemTable<F: Field> {
+    entries: Vec<MemTableEntry<F>>,
+}
+
+impl<F> Circuit<F> for MinimalMemTable<F>
+where
+    F: Field,
+{
+    type Config = CircuitConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
+
+    fn without_witnesses(&self) -> Self {
+        Self::default()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let memtbl_advice = [(); 6].map(|_| meta.advice_column());
+        let range = [(); 3].map(|_| meta.lookup_table_column());
+        let memtbl_sel = meta.complex_selector();
+    
+        let lw_advice = [(); 4].map(|_| meta.advice_column());
+        let lw_sel = meta.complex_selector();
+        // Reference memtbl schema
+        // | addr | id | value | is_last_write |
+        // Order really matters, latter we can make it several const
+        let ref_memtbl_schema = [memtbl_advice[0], memtbl_advice[2], memtbl_advice[5], memtbl_advice[4]];
+        let binary_range = range[0];
+
+        let memtbl_config = MemTableChip::configure(meta, memtbl_advice, range, memtbl_sel);
+        let lwtbl_config = LastWriteTableChip::configure(
+            meta,
+            ref_memtbl_schema,
+            memtbl_sel,
+            lw_advice,
+            lw_sel,
+            binary_range,
+        );
+
+        CircuitConfig {
+            memtbl_config,
+            lwtbl_config,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        // Get MemTableChip
+        let memtbl_chip = MemTableChip::<F>::construct(config.memtbl_config);
+        // Assign range
+        memtbl_chip.assign_range(layouter.namespace(|| "assign range"))?;
+        // Assign table
+        let lwtbl_from_memtbl = memtbl_chip.assign_table(layouter.namespace(|| "assign table"), &self.entries).unwrap();
+
+        for entry in lwtbl_from_memtbl.iter() {
+            println!("addr: {:?}, id: {:?}, value: {:?}", entry.addr, entry.id, entry.value);
+        }
+        let lwtbl_from_memtbl = lwtbl_from_memtbl[..lwtbl_from_memtbl.len() - 1].to_vec();
+        // Get LastWriteTableChip
+        let lwtbl_chip = LastWriteTableChip::<F>::construct(config.lwtbl_config);
+        // Memtbl schema | addr | id | value |
+        let ref_memtbl_schema = [
+            memtbl_chip.config().advice[0],
+            memtbl_chip.config().advice[2],
+            memtbl_chip.config().advice[5],
+        ];
+        // Lwtbk schema | addr | id | value |
+        let ref_lwtbl_schema = [
+            lwtbl_chip.config().advice[0],
+            lwtbl_chip.config().advice[1],
+            lwtbl_chip.config().advice[2],
+        ];
+        // Assign zero padding on memtbl
+        //LastWriteTableChip::<F>::zero_padding_one_row(layouter.namespace(|| "zero padding on memtbl"), ref_memtbl_schema, memtbl_chip.config.sel)?;
+        // Assign zero padding on lwtbl
+        //LastWriteTableChip::<F>::zero_padding_one_row(layouter.namespace(|| "zero padding on lwtbl"), ref_lwtbl_schema, lwtbl_chip.config.sel)?;
+
+        // Assign lwtbl from memtbl
+        lwtbl_chip.assign_lwtbl_from_memtbl(layouter.namespace(|| "assign lwtbl from memtbl"), &lwtbl_from_memtbl)?;
+
+        Ok(())
     }
 }
 
@@ -506,7 +835,7 @@ fn main() {
     // Prepare the private inputs to the circuit!
     let mut rng = OsRng;
     for id in 0..(1 << MEM_RANGE_BITS) {
-        // we only genegate 6 addresses, by Pigeonhole principle there must be some address with more than one entry
+        // we only genegate 6 addresses, by Pigeonhole principle there must be some addresses with more than one entry
         let addr = Fr::from(rng.gen_range(0..6) as u64);
         let value = Fr::from(rng.gen_range(0..(1 << VALUE_RANGE_BITS)) as u64);
         entries.push(MemTableEntry {
@@ -524,6 +853,12 @@ fn main() {
             a.addr.cmp(&b.addr)
         }
     });
+
+    println!("Sorted Entries are: ");
+    for entry in entries.iter() {
+        println!("addr: {:?}, id: {:?}, value: {:?}", entry.addr, entry.id, entry.value);
+    }
+    println!("End of sorted entries");
 
     // Create the circuit
     let circuit = MinimalMemTable { entries };
